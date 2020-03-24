@@ -93,6 +93,7 @@ void MyClass::compute()
         guiThread([progress]() { delete progress; }); // don't forget to clean up
     });
 }
+```
 Using `guiThread(...)` executes the function in the GUI thread by using `QMetaObject::invokeMethod(qApp, ..., Qt::QueuedConnection)`. The Qt way is hard to remember and tedious to write. Hence, this lib provides a shortcut `guiThread` which is also more explicit about what we are trying to achieve here.
 
 `workerThread(...)` internally uses the class `WorkerThread` (note the difference between small 'w' and capital 'W'). The lib's enums live inside this class. The construction of the `QProgressDialog` needs to finish before we do anything else with it. This is done by providing the parameter `WorkerThread::SYNC` to `guiThread`. Internally, it uses a `QMutex` to synchronize the GUI thread and this thread. So, it is basically a blocking call into the GUI thread (make sure that the GUI thread is always progressing). Now, the progress dialog can even react to the cancel button directly without any problems (we still need to handle it inside our computation, though). Because of modality the user has to wait for the computation to finish, but the GUI stays responsive (for the progress dialog) and the computation is a lot faster than calling `QApplication::processEvents()`.
