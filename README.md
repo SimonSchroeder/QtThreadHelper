@@ -35,7 +35,7 @@ Suppose you have an already existing function
 void MyClass::foo()
 {
     /* do some stuff */
-    QThread::currentThread()->sleep(10); // simulate work by sleeping 10 seconds
+    QThread::sleep(10); // simulate work by sleeping 10 seconds
 }
 ```
 If called by clicking a button or something, this will freeze the GUI for 10 seconds. Some of the time it is sufficient to just move the whole function into a lambda and call that in a different thread:
@@ -45,7 +45,7 @@ void MyClass::foo()
     workerThread([this]()
     {
         /* do some stuff */
-        QThread::currentThread()->sleep(10); // simulate work
+        QThread::sleep(10); // simulate work
     });
 }
 ```
@@ -62,8 +62,8 @@ void MyClass::compute()
     for(int i = 0; i < 10; ++i)
     {
         /* do some stuff */
-        QThread::currentThread()->sleep(1); //simulate work
-        progress.setValue(10 * (i+1));      // convert to percent
+        QThread::sleep(1);              //simulate work
+        progress.setValue(10 * (i+1));  // convert to percent
     }
 }
 ```
@@ -86,7 +86,7 @@ void MyClass::compute()
         for(int i = 0; i < 10; ++i)
         {
             /* do some stuff */
-            QThread::currentThread()->sleep(1); //simulate work
+            QThread::sleep(1); //simulate work
             guiThread([progress,i]() { progress.setValue(10 * (i+1)); }); // needs to be executed in GUI thread
         }
         
