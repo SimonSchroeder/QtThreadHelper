@@ -87,7 +87,7 @@ void MyClass::compute()
         {
             /* do some stuff */
             QThread::currentThread()->sleep(1); //simulate work
-            guiThread([progress]() { progress.setValue(10 * (i+1)); }); // needs to be executed in GUI thread
+            guiThread([progress,i]() { progress.setValue(10 * (i+1)); }); // needs to be executed in GUI thread
         }
         
         guiThread([progress]() { delete progress; }); // don't forget to clean up
