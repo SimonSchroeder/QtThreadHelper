@@ -42,11 +42,59 @@ If called by clicking a button or something, this will freeze the GUI for 10 sec
 ```c++
 void MyClass::foo()
 {
-   workerThread([this]()
-   {
-       /* do some stuff */
-       QThread::currentThread()->sleep(10); // simulate work
-   });
+    workerThread([this]()
+    {
+        /* do some stuff */
+        QThread::currentThread()->sleep(10); // simulate work
+    });
 }
 ```
 `workerThread(...)` calls `QThread::create(...)->start()` and also makes sure to clean-up the thread after itself. In the simplest example the whole function body is put inside the lambda.
+
+## Use case 2
+Often we have to update the GUI after doing something. One prominent example is using a `QProgressDialog` which needs to update while the thread is running. Let's start off by a progress dialog in the GUI thread:
+```c++
+void MyClass::compute()
+{
+    QProgressDialog progress(this);
+    progress.setWindowModality(Q::WindowModal);
+    
+    for(int i = 0; i < 10; ++i)
+    {
+        /* do some stuff */
+        QThread::currentThread()->sleep(1); //simulate work
+        progress.setValue(10 * (i+1));      // convert to percent
+    }
+}
+```
+If you have done it like this, you probably also already experienced that it is not possible to cancel because the GUI thread is blocking. Maybe you know the trick to call `QApplication::processEvents();` after `progress.setValue(...)`. This can significantly slow down you computation (even `processEvents` with a timeout). Next trick is to do this only like every 100 iteration (if you have a few thousand). But, even this might be slow and the cancel button of your progress dialog might not react on every click. Been there, done all of that.
+
+Best trick is to do the computation in a separate thread and let the GUI thread running. Now, we need to call back to the GUI thread for the progress dialog. This would look like the following:
+```c++
+void MyClass::compute()
+{
+    // put everything into a worker thread
+    workerThread([this]()
+    {
+        QProgressDialog *progress;
+        guiThread(WorkerThread::SYNC, [this,&progress]()
+        {
+            progress = new QProgressDialog(this);
+            progress->setWindowModality(Qt::WindowModel);
+        });
+        
+        for(int i = 0; i < 10; ++i)
+        {
+            /* do some stuff */
+            QThread::currentThread()->sleep(1); //simulate work
+            guiThread([progress]() { progress.setValue(10 * (i+1)); }); // needs to be executed in GUI thread
+        }
+        
+        guiThread([progress]() { delete progress; }); // don't forget to clean up
+    });
+}
+Using `guiThread(...)` executes the function in the GUI thread by using `QMetaObject::invokeMethod(qApp, ..., Qt::QueuedConnection)`. The Qt way is hard to remember and tedious to write. Hence, this lib provides a shortcut `guiThread` which is also more explicit about what we are trying to achieve here.
+
+`workerThread(...)` internally uses the class `WorkerThread` (note the difference between small 'w' and capital 'W'). The lib's enums live inside this class. The construction of the `QProgressDialog` needs to finish before we do anything else with it. This is done by providing the parameter `WorkerThread::SYNC` to `guiThread`. Internally, it uses a `QMutex` to synchronize the GUI thread and this thread. So, it is basically a blocking call into the GUI thread (make sure that the GUI thread is always progressing). Now, the progress dialog can even react to the cancel button directly without any problems (we still need to handle it inside our computation, though). Because of modality the user has to wait for the computation to finish, but the GUI stays responsive (for the progress dialog) and the computation is a lot faster than calling `QApplication::processEvents()`.
+
+This use case is highly encouraged.
