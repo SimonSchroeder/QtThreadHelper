@@ -15,7 +15,7 @@ Then include the header where you want to use these functions:
 
 ### How to use
 1. Create a single-shot temporary thread by calling `workerThread([](){ /* do stuff */ });`.
-1. Queue function calls into the GUI thread (when manipulating GUI elements) from another thread by calling `guiThread([]() { /* call function on widget */ });`.
+1. Queue function calls into the GUI thread (when manipulating GUI elements) from another thread by calling `guiThread([]() { /* call function on widget */ });`. Use `guiThread(WorkerThread::SYNC, []() { /* ... */ });` for a blocking call.
 1. Create a permanent worker thread object `WorkerThread *wt = new WorkerThread()` with its own event queue and continuously queue function calls: `wt->exec([]() { /* do stuff */ })`. Stop the event queue with `wt->quit()`.
 1. Easily use function arguments in all of the above, e.g. `workerThread([](int i) { /* do stuff */ }, 1);`.
 1. Use member functions instead of lambdas in any of the above, e.g. `guiThread(std::mem_fn(&MainWindow::setWindowTitle), this, "Title");`.
