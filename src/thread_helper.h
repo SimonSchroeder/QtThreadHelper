@@ -6,6 +6,7 @@
 #include <QAbstractEventDispatcher>
 #include <QGuiApplication>
 #include <QMutex>
+#include <QQueue>
 #include <QThread>
 
 /**
@@ -19,7 +20,7 @@
  * run a function. However, there is general boiler-plate code to clean-up after
  * use. Using new and AUTODELETE takes care of everything in a single-shot
  * execution. Use the helper function workerThread(...) directly to launch such
- * a single-shot thread for a function.
+ * a single thread for a function.
  *
  * In order to have a separate worker thread object call the default constructor
  * of WorkerThread. It is your responsibility to clean-up the object when your
@@ -35,7 +36,8 @@ public:
                 DELETETHREAD,   // Delete thread automatically when done. Don't delete WorkerThread object as it might be on the stack.
                 AUTODELETE      // Delete both thread and WorkerThread object when done. The WorkerThread object must be allocated on the heap.
               };
-    enum Schedule { ASYNC,      // Default.
+    enum Schedule { PAR,        // Non-serialized, non-blocking
+                    ASYNC,      // Default. Serialized, non-blocking
                     SYNC        // Helper keyword for a synchronous call to the GUI thread.
                   };
 
@@ -71,6 +73,72 @@ signals:
 //public slots:
 public:
     inline void quit();
+
+    /**
+     * @brief Helper class for serialization of calls into GUI thread.
+     *
+     * Serializes function calls into the GUI thread. By default functions put
+     * into the event queue of the GUI thread can overtake each other. This
+     * class ensures that only one function at a time is queued into the
+     * GUI thread's event loop. Use WorkerThread::getSerializer() to get
+     * the single instance for this thread.
+     */
+    class Serializer
+    {
+        /**
+         * @brief Internal helper class
+         *
+         * Actual implementation of the Serializer class. The Serializer object
+         * will be deleted when its containing thread finishes. Serializer's
+         * destructor makes sure this does not happen when there are still
+         * functions in the queue. Those will clean-up in the end if necessary.
+         */
+        class SerializerImpl
+        {
+            friend class Serializer;
+            QMutex mutex;
+            QQueue<std::function<void()>> queue;
+            bool running = false;
+            bool threadDeleted = false;
+
+        public:
+            template<class Function>
+            void enqueue(Function &&f);
+            template<class Function, typename... Args>
+            void enqueue(Function &&f, Args &&... args);
+
+            bool isEmpty() const { return queue.isEmpty(); }
+        };
+
+        SerializerImpl *impl;
+    public:
+        Serializer() : impl(new SerializerImpl()) {}
+        inline ~Serializer();
+
+        template<class Function>
+        void enqueue(Function &&f)
+        { impl->enqueue(std::forward<Function>(f)); }
+
+        template<class Function, typename... Args>
+        void enqueue(Function &&f, Args &&... args)
+        { impl->enqueue(std::forward<Function>(f), std::forward<Args>(args)...); }
+
+        /**
+         * @brief Check if there are any function calls queued.
+         * @return true if queue is empty
+         */
+        bool isEmpty() const { return impl->isEmpty(); }
+    };
+
+    /**
+     * @brief Get a single instance of Serializer for each thread.
+     * @return current thread's Serializer object
+     */
+    static inline Serializer &getSerializer()
+    {
+        thread_local Serializer serializer;
+        return serializer;
+    }
 };
 
 // HELPER FUNCTIONS ============================================================
@@ -408,7 +476,7 @@ WorkerThread *workerThread(Function &&f, Args &&... args)
 template<class Function> inline
 void guiThread(Function &&f)
 {
-    QMetaObject::invokeMethod(qGuiApp, f, Qt::QueuedConnection);
+    guiThread(WorkerThread::ASYNC, std::forward<Function>(f));
 }
 
 /**
@@ -423,12 +491,7 @@ void guiThread(Function &&f)
 template<class Function, typename... Args> inline
 void guiThread(Function &&f, Args &&... args)
 {
-    QMetaObject::invokeMethod(qGuiApp,
-                              [f=std::forward<Function>(f),args=std::make_tuple(std::forward<Args>(args)...)]() mutable
-                              {
-                                std::apply(std::forward<Function>(f), std::forward<decltype(args)>(args));
-                              },
-                              Qt::QueuedConnection);
+    guiThread(WorkerThread::ASYNC, std::forward<Function>(f), std::forward<Args>(args)...);
 }
 
 /**
@@ -436,25 +499,31 @@ void guiThread(Function &&f, Args &&... args)
  * @param f         function to call
  *
  * Call this function with WorkerThread::SYNC to execute the function f
- * and block until the call is done.
+ * and block until the call is done. Call with WorkerThread::PAR (for parallel)
+ * if the order of execution does not matter.
  */
 template<class Function> inline
 void guiThread(WorkerThread::Schedule schedule, Function &&f)
 {
     switch(schedule)
     {
+    case WorkerThread::PAR:
+        QMetaObject::invokeMethod(qGuiApp, f, Qt::QueuedConnection);
+        break;
     case WorkerThread::ASYNC:
-        guiThread(std::forward<Function>(f));
+        WorkerThread::getSerializer().enqueue(std::forward<Function>(f));
         break;
     case WorkerThread::SYNC:
         {
             QMutex syncMutex;
             syncMutex.lock();   // lock for GUI thread
-            guiThread([f=std::forward<Function>(f),&syncMutex]() mutable
-                      {
-                        std::invoke(std::forward<Function>(f));
-                        syncMutex.unlock();
-                      });
+            QMetaObject::invokeMethod(qGuiApp,
+                                      [f=std::forward<Function>(f),&syncMutex]() mutable
+                                      {
+                                        std::invoke(std::forward<Function>(f));
+                                        syncMutex.unlock();
+                                      },
+                                      Qt::QueuedConnection);
             syncMutex.lock();   // wait for GUI call to finish
             syncMutex.unlock();
         }
@@ -468,29 +537,165 @@ void guiThread(WorkerThread::Schedule schedule, Function &&f)
  * @param args      arguments for f
  *
  * Call this function with WorkerThread::SYNC to execute the function f with
- * arguments args and block until the call is done.
+ * arguments args and block until the call is done. Call with WorkerThread::PAR
+ * (for parallel) if the order of execution does not matter.
  */
 template<class Function, typename... Args> inline
 void guiThread(WorkerThread::Schedule schedule, Function &&f, Args &&... args)
 {
     switch(schedule)
     {
+    case WorkerThread::PAR:
+        QMetaObject::invokeMethod(qGuiApp,
+                                  [f=std::forward<Function>(f),args=std::make_tuple(std::forward<Args>(args)...)]() mutable
+                                  {
+                                    std::apply(std::forward<Function>(f), std::forward<decltype(args)>(args));
+                                  },
+                                  Qt::QueuedConnection);
+        break;
     case WorkerThread::ASYNC:
-        guiThread(std::forward<Function>(f), std::forward<Args>(args)...);
+        WorkerThread::getSerializer().enqueue(std::forward<Function>(f), std::forward<Args>(args)...);
         break;
     case WorkerThread::SYNC:
         {
             QMutex syncMutex;
             syncMutex.lock();   // lock for GUI thread
-            guiThread([f=std::forward<Function>(f),args=std::make_tuple(std::forward<Args>(args)...),&syncMutex]() mutable
-                      {
-                        std::apply(std::forward<Function>(f), std::forward<decltype(args)>(args));
-                        syncMutex.unlock();
-                      });
+            QMetaObject::invokeMethod(qGuiApp,
+                                      [f=std::forward<Function>(f),args=std::make_tuple(std::forward<Args>(args)...),&syncMutex]() mutable
+                                      {
+                                        std::apply(std::forward<Function>(f), std::forward<decltype(args)>(args));
+                                        syncMutex.unlock();
+                                      },
+                                      Qt::QueuedConnection);
             syncMutex.lock();   // wait for GUI call to finish
             syncMutex.unlock();
         }
         break;
+    }
+}
+
+/**
+ * @brief Queue a new function call to be executed serialized for this thread.
+ * @param f         function to call
+ *
+ * This will queue new function calls to be executed in the GUI's event loop.
+ * If no other function from this thread is already executing, the current
+ * function will be pushed to the GUI's event loop directly. When done the
+ * function looks for further functions in the queue and sends the next one
+ * to the GUI thread. If no functions are remaining in the queue and the thread
+ * has already finished, the underlying SerializerImpl object is deleted.
+ */
+template<class Function>
+void WorkerThread::Serializer::SerializerImpl::enqueue(Function &&f)
+{
+    auto lambda = [f=std::forward<Function>(f),this]() mutable
+    {
+        std::invoke(std::forward<Function>(f));
+
+        this->mutex.lock();
+        if(this->isEmpty())
+        {
+            running = false;
+            if(threadDeleted)
+            {
+                this->mutex.unlock();
+                delete this;
+                return;
+            }
+        }
+        else
+        {
+            QMetaObject::invokeMethod(qGuiApp, this->queue.dequeue(), Qt::QueuedConnection);
+        }
+        this->mutex.unlock();
+    };
+
+    this->mutex.lock();
+    if(this->isEmpty() && !running)
+    {
+        running = true;
+        QMetaObject::invokeMethod(qGuiApp, lambda, Qt::QueuedConnection);
+    }
+    else
+    {
+        this->queue.enqueue(lambda);
+    }
+    this->mutex.unlock();
+}
+
+/**
+ * @brief Queue a new function call to be executed serialized for this thread.
+ * @param f         function to call
+ * @param args      arguments to f
+ *
+ * This will queue new function calls to be executed in the GUI's event loop.
+ * If no other function from this thread is already executing, the current
+ * function will be pushed to the GUI's event loop directly. When done the
+ * function looks for further functions in the queue and sends the next one
+ * to the GUI thread. If no functions are remaining in the queue and the thread
+ * has already finished, the underlying SerializerImpl object is deleted.
+ */
+template<class Function, typename... Args>
+void WorkerThread::Serializer::SerializerImpl::enqueue(Function &&f, Args &&... args)
+{
+    auto lambda = [f=std::forward<Function>(f),args=std::make_tuple(std::forward<Args>(args)...),this]() mutable
+    {
+        std::apply(std::forward<Function>(f), std::forward<decltype(args)>(args));
+
+        this->mutex.lock();
+        if(this->isEmpty())
+        {
+            running = false;
+            if(threadDeleted)
+            {
+                this->mutex.unlock();
+                delete this;
+                return;
+            }
+        }
+        else
+        {
+            QMetaObject::invokeMethod(qGuiApp, this->queue.dequeue(), Qt::QueuedConnection);
+        }
+        this->mutex.unlock();
+    };
+
+    this->mutex.lock();
+    if(this->isEmpty() && !running)
+    {
+        running = true;
+        QMetaObject::invokeMethod(qGuiApp, lambda, Qt::QueuedConnection);
+    }
+    else
+    {
+        this->queue.enqueue(lambda);
+    }
+    this->mutex.unlock();
+}
+
+/**
+ * @brief Destructor for the Serializer's per-thread object.
+ *
+ * Given that only one Serializer object is used per thread (by calling
+ * getSerializer() instead of the constructor) the destructor is called when
+ * the thread finishes. The destructor only cleans up if there are no more
+ * functions in the queue and none are still running. Otherwise, the lambda
+ * functions wrapping the actual function call will clean up everything when
+ * done.
+ */
+WorkerThread::Serializer::~Serializer()
+{
+    impl->mutex.lock();
+    if(impl->queue.isEmpty() && !impl->running)
+    {
+        impl->threadDeleted = true;
+        impl->mutex.unlock();
+        delete impl;
+    }
+    else
+    {
+        impl->threadDeleted = true;
+        impl->mutex.unlock();
     }
 }
 
