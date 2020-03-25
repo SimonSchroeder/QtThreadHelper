@@ -67,7 +67,7 @@ void MyClass::compute()
     }
 }
 ```
-If you have done it like this, you probably also already experienced that it is not possible to cancel because the GUI thread is blocking. Maybe you know the trick to call `QApplication::processEvents();` after `progress.setValue(...)`. This can significantly slow down you computation (even `processEvents` with a timeout). Next trick is to do this only like every 100 iteration (if you have a few thousand). But, even this might be slow and the cancel button of your progress dialog might not react on every click. Been there, done all of that.
+If you have done it like this, you probably also already experienced that it is not possible to reliably cancel because the GUI thread is blocking (if the dialog is modal `setValue` will call `processEvents()` on its own). Maybe you know the trick to call `QApplication::processEvents();` after `progress.setValue(...)`. This can significantly slow down you computation (even `processEvents` with a timeout). Next trick is to do this only like every 100 iteration (if you have a few thousand). But, even this might be slow and the cancel button of your progress dialog might not react on every click. Been there, done all of that.
 
 Best trick is to do the computation in a separate thread and let the GUI thread running. Now, we need to call back to the GUI thread for the progress dialog. This would look like the following:
 ```c++
@@ -99,3 +99,54 @@ Using `guiThread(...)` executes the function in the GUI thread by using `QMetaOb
 `workerThread(...)` internally uses the class `WorkerThread` (note the difference between small 'w' and capital 'W'). The lib's enums live inside this class. The construction of the `QProgressDialog` needs to finish before we do anything else with it. This is done by providing the parameter `WorkerThread::SYNC` to `guiThread`. Internally, it uses a `QMutex` to synchronize the GUI thread and this thread. So, it is basically a blocking call into the GUI thread (make sure that the GUI thread is always progressing). Now, the progress dialog can even react to the cancel button directly without any problems (we still need to handle it inside our computation, though). Because of modality the user has to wait for the computation to finish, but the GUI stays responsive (for the progress dialog) and the computation is a lot faster than calling `QApplication::processEvents()`.
 
 This use case is highly encouraged.
+
+## Use case 3
+This last use case employs the class `WorkerThread` directly. You might think of some scenarios where a dedicated worker thread is helpful. One such case is drawing on a canvas widget when updating might take a little too long. In that case we can put drawing into a separate thread, first drawing onto a `QPixmap` and later blitting that pixmap onto the widget. This also allows to interrupt drawing when done correctly (e.g. because the user moved around or zoomed). Let's start out with a constructor and destructor (here I will prefix all member variable with `m_`):
+```c++
+MyClass::MyClass() : m_drawingThread(new WorkerThread()) { /* ... */ }
+MyClass::~MyClass() { delete m_drawingThread; } // we could also use a smart pointer here
+```
+Now, we sketch a drawing method that allows for interrupting and also collapses multiple draw invocations (assuming that these are triggered by user interaction and are not continuously arriving):
+```c++
+void MyClass:draw()
+{
+    m_interruptDrawing = true;  // interrupt any ongoing off-screen drawing
+    ++m_currentDrawingId;       // the drawing ID is used for collapsing of drawing calls
+    
+    const int myDrawingId = m_currentDrawingId; // no race conditions here if MyClass::draw() is only called from GUI thread
+    
+    m_drawingThread->exec([this,myDrawingId]()  // queue drawing call in our worker thread
+    {
+        if(myDrawingId != m_currentDrawingId)   // there is already the next drawing request -> abort
+            return;
+        
+        m_interruptDrawing = false;             // reset interruption
+        
+        QPixmap *pixmap = new QPixmap(...);     // create pixmap in canvas size
+        QPainter painter(pixmap);
+        for(/* all objects to be drawn */)
+        {
+            if(m_interruptDrawing)
+                break;
+                
+            // draw object...
+        }
+        painter.end();                          // only after this will the pixmap be useable
+        
+        if(!m_interruptDrawing)                 // drawing finished successfully without interruption
+        {
+            guiThread([this,pixmap]()           // update widget with pixmap (in this particular case
+            {                                   //                            the call to guiThread is superfluous)
+                this->setPixmap(*pixmap);
+                this->update();                 // trigger call to paintEvent()
+                delete pixmap;
+            });
+        }
+    });
+}
+
+void MyClass::paintEvent(QPaintEvent *)
+{
+    QPainter painter(this);                     // assuming that 'this' is a widget to paint on
+    painter.drawPixmap(0,0,m_pixmap);           // draw full pixmap of same size starting from the corner
+}
