@@ -150,3 +150,9 @@ void MyClass::paintEvent(QPaintEvent *)
     QPainter painter(this);                     // assuming that 'this' is a widget to paint on
     painter.drawPixmap(0,0,m_pixmap);           // draw full pixmap of same size starting from the corner
 }
+```
+
+## Summary
+We have seen a few use cases where this lib might come in handy. It certainly helps for simple kinds of multithreading. For small computations or while some modal widget is running a temporary thread can be launched by calling `workerThread(...)`, usually with a lambda function. At any time from a separate thread we can queue function calls to the GUI thread by calling `guiThread(...)`. Finally, a permanent worker thread with an easy way to schedule functions in the event queue can be created by instanciating an object of class `WorkerThread`.
+
+Inside the source directory is a single Qt project file. All the interesting stuff happens inside `mainwindow.cpp`. You will get a window with several buttons to trigger some small examples. Some examples print to the console (on Windows just run from within QtCreator) and some change the window title. From top to bottom the examples introduce one feature after the other.
