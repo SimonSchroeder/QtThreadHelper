@@ -28,6 +28,7 @@ MainWindow::MainWindow(QWidget *parent)
     QPushButton *buttonExample7 = new QPushButton(tr("Example 7: manual AUTODELETE"));
     QPushButton *buttonExample8 = new QPushButton(tr("Example 8: manual"));
     QPushButton *buttonExample9 = new QPushButton(tr("Example 9: worker thread"));
+    QPushButton *buttonExample10 = new QPushButton(tr("Example 10: workerThreadJoin (non-blocking)"));
 
     layout->addWidget(buttonExample1);
     layout->addWidget(buttonExample2);
@@ -38,6 +39,7 @@ MainWindow::MainWindow(QWidget *parent)
     layout->addWidget(buttonExample7);
     layout->addWidget(buttonExample8);
     layout->addWidget(buttonExample9);
+    layout->addWidget(buttonExample10);
 
     connect(buttonExample1, &QPushButton::clicked, this, &MainWindow::example1);
     connect(buttonExample2, &QPushButton::clicked, this, &MainWindow::example2);
@@ -48,6 +50,7 @@ MainWindow::MainWindow(QWidget *parent)
     connect(buttonExample7, &QPushButton::clicked, this, &MainWindow::example7);
     connect(buttonExample8, &QPushButton::clicked, this, &MainWindow::example8);
     connect(buttonExample9, &QPushButton::clicked, this, &MainWindow::example9);
+    connect(buttonExample10, &QPushButton::clicked, this, &MainWindow::example10);
 }
 
 MainWindow::~MainWindow()
@@ -322,6 +325,28 @@ void MainWindow::example9()
         widget->draw();     // green image
         widget->draw();     // cyan image   -> directly interrupt previous draw call
     });
+}
+
+void MainWindow::example10()
+{
+    // non-blocking progress dialog with joinable (non-blocking) thread
+    QProgressDialog pd(this);
+
+    double ret_val = 0.0;
+    workerThreadJoin([&pd,&ret_val]()
+    {
+        for(int i = 0; i < 100; ++i)
+        {
+            guiThread([&pd,i]() { pd.setValue(i); });
+            QThread::currentThread()->msleep(100);
+        }
+
+        guiThread(std::mem_fn(&QProgressDialog::setValue), &pd, 100);
+
+        ret_val = 42.0;
+    });
+
+    QMessageBox::information(this, tr("Returned value"), tr("Value returned from thread: %1").arg(ret_val));
 }
 
 

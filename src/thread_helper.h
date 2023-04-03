@@ -23,7 +23,7 @@
  * a single thread for a function.
  *
  * In order to have a separate worker thread object call the default constructor
- * of WorkerThread. It is your responsibility to clean-up the object when your
+ * of WorkerThread. It is your responsibility to clean-up the object when you are
  * done. Execute a function in the context of this thread by calling exec(...).
  * This will take care that the function call is put into the event queue of the
  * thread.
@@ -34,11 +34,13 @@ class WorkerThread : public QObject
 public:
     enum Type { PERSISTENT,     // Create persistent WorkerThread object which can be re-used.
                 DELETETHREAD,   // Delete thread automatically when done. Don't delete WorkerThread object as it might be on the stack.
-                AUTODELETE      // Delete both thread and WorkerThread object when done. The WorkerThread object must be allocated on the heap.
+                AUTODELETE,     // Delete both thread and WorkerThread object when done. The WorkerThread object must be allocated on the heap.
               };
     enum Schedule { PAR,        // Non-serialized, non-blocking
                     ASYNC,      // Default. Serialized, non-blocking
-                    SYNC        // Helper keyword for a synchronous call to the GUI thread.
+                    SYNC,       // Helper keyword for a synchronous call, e.g. to the GUI thread.
+                    JOIN=SYNC,  // Alternative name for a synchronous call.
+                    NONBLOCKING_JOIN,   // Does not block event handling of the caller. Joins with the worker thread, i.e. waits for the worker thread to finish.
                   };
 
 private:
@@ -55,6 +57,8 @@ public:
     inline                                      WorkerThread(Type type);
     template<class Function>                    WorkerThread(Type type, Function &&f);
     template<class Function, typename... Args>  WorkerThread(Type type, Function &&f, Args &&... args);
+    template<class Function>                    WorkerThread(Type type, Schedule schedule, Function &&f);
+    template<class Function, typename... Args>  WorkerThread(Type type, Schedule schedule, Function &&f, Args &&...args);
     // Destructor ==============================================================
     inline ~WorkerThread();
     // Deleted functions/constructors ==========================================
@@ -66,6 +70,8 @@ public:
     // Execute task in persistent WorkerThread object ==========================
     template<class Function>                    void exec(Function &&f);
     template<class Function, typename... Args>  void exec(Function &&f, Args &&... args);
+    template<class Function>                    void exec(Schedule schedule, Function &&f);
+    template<class Function, typename... Args>  void exec(Schedule schedule, Function &&f, Args &&...args);
 
 signals:
     void done();
@@ -75,13 +81,15 @@ public:
     inline void quit();
 
     /**
-     * @brief Helper class for serialization of calls into GUI thread.
+     * @brief Helper class for serialization of calls into GUI thread or
+     *        within this thread.
      *
-     * Serializes function calls into the GUI thread. By default functions put
-     * into the event queue of the GUI thread can overtake each other. This
-     * class ensures that only one function at a time is queued into the
-     * GUI thread's event loop. Use WorkerThread::getSerializer() to get
-     * the single instance for this thread.
+     * Serializes function calls into the GUI thread or this thread. By default
+     * functions put into the event queue of the GUI thread can overtake each
+     * other. This class ensures that only one function at a time is queued into
+     * a thread's event loop. Use WorkerThread::getSerializer() to get
+     * the single instance for this thread or WorkerThread::getGUISerializer()
+     * for a single instance calling GUI functions.
      */
     class Serializer
     {
@@ -103,9 +111,9 @@ public:
 
         public:
             template<class Function>
-            void enqueue(Function &&f);
+            void enqueue(QThread *thread, Function &&f);
             template<class Function, typename... Args>
-            void enqueue(Function &&f, Args &&... args);
+            void enqueue(QThread *thread, Function &&f, Args &&... args);
 
             bool isEmpty() const { return queue.isEmpty(); }
         };
@@ -116,12 +124,12 @@ public:
         inline ~Serializer();
 
         template<class Function>
-        void enqueue(Function &&f)
-        { impl->enqueue(std::forward<Function>(f)); }
+        void enqueue(QThread *thread, Function &&f)
+        { impl->enqueue(thread, std::forward<Function>(f)); }
 
         template<class Function, typename... Args>
-        void enqueue(Function &&f, Args &&... args)
-        { impl->enqueue(std::forward<Function>(f), std::forward<Args>(args)...); }
+        void enqueue(QThread *thread, Function &&f, Args &&... args)
+        { impl->enqueue(thread, std::forward<Function>(f), std::forward<Args>(args)...); }
 
         /**
          * @brief Check if there are any function calls queued.
@@ -139,6 +147,16 @@ public:
         thread_local Serializer serializer;
         return serializer;
     }
+
+    /**
+     * @brief Get a single instance of Serializer for each thread.
+     * @return current thread's GUI Serializer object
+     */
+    static inline Serializer &getGUISerializer()
+    {
+        thread_local Serializer serializer;
+        return serializer;
+    }
 };
 
 // HELPER FUNCTIONS ============================================================
@@ -146,6 +164,14 @@ template<class Function> inline
 WorkerThread *workerThread(Function &&f);
 template<class Function, typename... Args> inline
 WorkerThread *workerThread(Function &&f, Args &&... args);
+template<class Function> inline
+WorkerThread *workerThread(WorkerThread::Schedule s, Function &&f);
+template<class Function, typename... Args> inline
+WorkerThread *workerThread(WorkerThread::Schedule s, Function &&f, Args &&... args);
+template<class Function> inline
+WorkerThread *workerThreadJoin(Function &&f);
+template<class Function, typename... Args> inline
+WorkerThread *workerThreadJoin(Function &&f, Args &&... args);
 
 template<class Function> inline
 void guiThread(Function &&f);
@@ -227,7 +253,6 @@ WorkerThread::WorkerThread(Type type)
     case AUTODELETE:
         break;
     }
-
 }
 
 /**
@@ -241,40 +266,8 @@ WorkerThread::WorkerThread(Type type)
  */
 template<class Function>
 WorkerThread::WorkerThread(Type type, Function &&f)
-    : type(type)
+    : WorkerThread(type, ASYNC, std::forward<Function>(f))
 {
-    switch(type)
-    {
-    case PERSISTENT:
-        thread = new QThread();
-        connect(thread, &QThread::finished, [this]() { this->thread = nullptr; });
-        connect(thread, &QThread::finished, this, &WorkerThread::done);
-        connect(thread, &QThread::finished, thread, &QThread::deleteLater);
-        thread->start();
-        this->exec(std::forward<Function>(f));
-        break;
-    case DELETETHREAD:
-        thread = QThread::create([this,f=std::forward<Function>(f)]() mutable
-        {
-            connect(thread, &QThread::finished, [this]() { this->thread = nullptr; });
-            connect(thread, &QThread::finished, this, &WorkerThread::done);
-            connect(thread, &QThread::finished, thread, &QThread::deleteLater);
-            std::invoke(std::forward<Function>(f));
-        });
-        thread->start();
-        break;
-    case AUTODELETE:
-        thread = QThread::create([this,f=std::forward<Function>(f)]() mutable
-        {
-            connect(thread, &QThread::finished, [this]() { this->thread = nullptr; });
-            connect(thread, &QThread::finished, this, &WorkerThread::done);
-            connect(this,  &WorkerThread::done, [this]() { delete this; });
-            connect(thread, &QThread::finished, thread, &QThread::deleteLater);
-            std::invoke(std::forward<Function>(f));
-        });
-        thread->start();
-        break;
-    }
 }
 
 /**
@@ -289,7 +282,33 @@ WorkerThread::WorkerThread(Type type, Function &&f)
  */
 template<class Function, typename... Args>
 WorkerThread::WorkerThread(Type type, Function &&f, Args &&... args)
+    : WorkerThread(type, ASYNC, std::forward<Function>(f), std::forward<Args>(args)...)
 {
+}
+
+/**
+ * @brief Create worker thread and immediately execute function with no arguments.
+ * @param type      variant of worker thread
+ * @param s         schedule of execution – e.g. use NONBLOCKING_JOIN to wait without blocking
+ * @param f         function to call
+ *
+ * Create a worker thread object and immediately call the function f. If the
+ * type is WorkerThread::PERSISTENT more functions can be executed by calling
+ * exec(...). Use schedule WorkerThread::JOIN for a blocking join or
+ * WorkerThread::NONBLOCKING_JOIN to wait without blocking.
+ */
+template<class Function>
+WorkerThread::WorkerThread(Type type, Schedule schedule, Function &&f)
+    : type(type)
+{
+    QMutex syncMutex;       // for SYNC/JOIN
+    if(schedule == SYNC)
+        syncMutex.lock();
+
+    QEventLoop eventLoop;   // for NONBLOCKING_JOIN
+
+    // Ignore PAR/ASYNC as for a single function call it is the same.
+
     switch(type)
     {
     case PERSISTENT:
@@ -298,29 +317,135 @@ WorkerThread::WorkerThread(Type type, Function &&f, Args &&... args)
         connect(thread, &QThread::finished, this, &WorkerThread::done);
         connect(thread, &QThread::finished, thread, &QThread::deleteLater);
         thread->start();
-        this->exec(std::forward<Function>(f), std::forward<Args>(args)...);
+        this->exec(schedule, std::forward<Function>(f));
         break;
     case DELETETHREAD:
-        thread = QThread::create([this,f=std::forward<Function>(f)](auto &&... args) mutable
+        thread = QThread::create([this,schedule,&syncMutex,&eventLoop,f=std::forward<Function>(f)]() mutable
         {
+            if(schedule == NONBLOCKING_JOIN)
+                connect(thread, &QThread::finished, [&eventLoop]() { eventLoop.exit(); });
+            connect(thread, &QThread::finished, [this]() { this->thread = nullptr; });
+            connect(thread, &QThread::finished, this, &WorkerThread::done);
+            connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+            std::invoke(std::forward<Function>(f));
+            if(schedule == SYNC)
+                syncMutex.unlock();
+        });
+        if(schedule == NONBLOCKING_JOIN)
+        {
+            QMetaObject::invokeMethod(&eventLoop, [this]() { this->thread->start(); }, Qt::QueuedConnection);
+            eventLoop.exec();
+        }
+        else
+            thread->start();
+        break;
+    case AUTODELETE:
+        thread = QThread::create([this,schedule,&syncMutex,&eventLoop,f=std::forward<Function>(f)]() mutable
+        {
+            if(schedule == NONBLOCKING_JOIN)
+                connect(thread, &QThread::finished, [&eventLoop]() { eventLoop.exit(); });
+            connect(thread, &QThread::finished, [this]() { this->thread = nullptr; });
+            connect(thread, &QThread::finished, this, &WorkerThread::done);
+            connect(this,  &WorkerThread::done, [this]() { delete this; });
+            connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+            std::invoke(std::forward<Function>(f));
+            if(schedule == SYNC)
+                syncMutex.unlock();
+        });
+        if(schedule == NONBLOCKING_JOIN)
+        {
+            QMetaObject::invokeMethod(&eventLoop, [this]() { this->thread->start(); }, Qt::QueuedConnection);
+            eventLoop.exec();
+        }
+        else
+            thread->start();
+        break;
+    }
+
+    if(schedule == SYNC)
+    {
+        syncMutex.lock();       // wait for execution of function within thread to finish
+        syncMutex.unlock();
+    }
+}
+
+/**
+ * @brief Create worker thread and immediately execute function with arguments.
+ * @param type      variant of worker thread
+ * @param s         schedule of execution – e.g. use NONBLOCKING_JOIN to wait without blocking
+ * @param f         function to call
+ * @param args      arguments for f
+ *
+ * Create a worker thread object and immediately call the function f with the
+ * arguments args. If the type is WorkerThread::PERSISTENT more functions can
+ * be executed by calling exec(...). Use schedule WorkerThread::JOIN for a
+ * blocking join or WorkerThread::NONBLOCKING_JOIN to wait without blocking.
+ */
+template<class Function, typename... Args>
+WorkerThread::WorkerThread(Type type, Schedule schedule, Function &&f, Args &&... args)
+{
+    QMutex syncMutex;           // for SYNC/JOIN
+    if(schedule == SYNC)
+        syncMutex.lock();
+
+    QEventLoop eventLoop;       // for NONBLOCKING_JOIN
+
+    switch(type)
+    {
+    case PERSISTENT:
+        thread = new QThread();
+        connect(thread, &QThread::finished, [this]() { this->thread = nullptr; });
+        connect(thread, &QThread::finished, this, &WorkerThread::done);
+        connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+        thread->start();
+        this->exec(schedule, std::forward<Function>(f), std::forward<Args>(args)...);
+        break;
+    case DELETETHREAD:
+        thread = QThread::create([this,schedule,&syncMutex,&eventLoop,f=std::forward<Function>(f)](auto &&... args) mutable
+        {if(schedule == NONBLOCKING_JOIN)
+                connect(thread, &QThread::finished, [&eventLoop]() { eventLoop.exit(); });
             connect(thread, &QThread::finished, [this]() { this->thread = nullptr; });
             connect(thread, &QThread::finished, this, &WorkerThread::done);
             connect(thread, &QThread::finished, thread, &QThread::deleteLater);
             std::invoke(std::forward<Function>(f), std::forward<Args>(args)...);
+            if(schedule == SYNC)
+                syncMutex.unlock();
         }, std::forward<Args>(args)...);
-        thread->start();
+        if(schedule == NONBLOCKING_JOIN)
+        {
+            QMetaObject::invokeMethod(&eventLoop, [this]() { this->thread->start(); }, Qt::QueuedConnection);
+            eventLoop.exec();
+        }
+        else
+            thread->start();
         break;
     case AUTODELETE:
-        thread = QThread::create([this,f=std::forward<Function>(f)](auto &&... args) mutable
+        thread = QThread::create([this,schedule,&syncMutex,&eventLoop,f=std::forward<Function>(f)](auto &&... args) mutable
         {
+            if(schedule == NONBLOCKING_JOIN)
+                connect(thread, &QThread::finished, [&eventLoop]() { eventLoop.exit(); });
             connect(thread, &QThread::finished, [this]() { this->thread = nullptr; });
             connect(thread, &QThread::finished, this, &WorkerThread::done);
             connect(this,  &WorkerThread::done, [this]() { delete this; });
             connect(thread, &QThread::finished, thread, &QThread::deleteLater);
             std::invoke(std::forward<Function>(f), std::forward<Args>(args)...);
+            if(schedule == SYNC)
+                syncMutex.unlock();
         }, std::forward<Args>(args)...);
-        thread->start();
+        if(schedule == NONBLOCKING_JOIN)
+        {
+            QMetaObject::invokeMethod(&eventLoop, [this]() { this->thread->start(); }, Qt::QueuedConnection);
+            eventLoop.exec();
+        }
+        else
+            thread->start();
         break;
+    }
+
+    if(schedule == SYNC)
+    {
+        syncMutex.lock();       // wait for execution of function within thread to finish
+        syncMutex.unlock();
     }
 }
 
@@ -340,36 +465,7 @@ WorkerThread::~WorkerThread()
 template<class Function>
 void WorkerThread::exec(Function &&f)
 {
-    switch(type)
-    {
-    case PERSISTENT:
-        // Wait for running event queue if we just started the thread.
-        while(!QAbstractEventDispatcher::instance(thread))
-            QThread::currentThread()->msleep(1);
-        QMetaObject::invokeMethod(QAbstractEventDispatcher::instance(thread), std::forward<Function>(f), Qt::QueuedConnection);
-        break;
-    case DELETETHREAD:
-        thread = QThread::create([this,f=std::forward<Function>(f)]() mutable
-        {
-            connect(thread, &QThread::finished, [this]() { this->thread = nullptr; });
-            connect(thread, &QThread::finished, this, &WorkerThread::done);
-            connect(thread, &QThread::finished, thread, &QThread::deleteLater);
-            std::invoke(std::forward<Function>(f));
-        });
-        thread->start();
-        break;
-    case AUTODELETE:
-        thread = QThread::create([this,f=std::forward<Function>(f)]() mutable
-        {
-            connect(thread, &QThread::finished, [this]() { this->thread = nullptr; });
-            connect(thread, &QThread::finished, this, &WorkerThread::done);
-            connect(this,  &WorkerThread::done, [this]() { delete this; });
-            connect(thread, &QThread::finished, thread, &QThread::deleteLater);
-            std::invoke(std::forward<Function>(f));
-        });
-        thread->start();
-        break;
-    }
+    this->exec(ASYNC, std::forward<Function>(f));
 }
 
 /**
@@ -385,40 +481,233 @@ void WorkerThread::exec(Function &&f)
 template<class Function, typename... Args>
 void WorkerThread::exec(Function &&f, Args &&... args)
 {
+    this->exec(ASYNC, std::forward<Function>(f), std::forward<Args>(args)...);
+}
+
+/**
+ * @brief Execute a function with no arguments in the threads context.
+ * @param schedule  schedule to use
+ * @param f         function to call
+ *
+ * Executes the function f in the context of this worker thread. For the
+ * WorkerThread::PERSISTENT variant the function call will be queued in the
+ * event queue. This serializes and synchronizes function calls within this
+ * thread. Different schedules can be used, e.g. to wait for the execution
+ * to finish.
+ */
+template<class Function>
+void WorkerThread::exec(Schedule schedule, Function &&f)
+{
+    QMutex syncMutex;       // for SYNC/JOIN
+    if(schedule == SYNC)
+        syncMutex.lock();
+
+    QEventLoop eventLoop;   // for NONBLOCKING_JOIN
+
     switch(type)
     {
     case PERSISTENT:
         // Wait for running event queue if we just started the thread.
         while(!QAbstractEventDispatcher::instance(thread))
             QThread::currentThread()->msleep(1);
-        QMetaObject::invokeMethod(QAbstractEventDispatcher::instance(thread),
-                                  [f=std::forward<Function>(f),args=std::make_tuple(std::forward<Args>(args)...)]() mutable
-                                  {
-                                    std::apply(std::forward<Function>(f), std::forward<decltype(args)>(args));
-                                  },
-                                  Qt::QueuedConnection);
+        switch(schedule)
+        {
+        case PAR:
+            QMetaObject::invokeMethod(QAbstractEventDispatcher::instance(thread), std::forward<Function>(f), Qt::QueuedConnection);
+            break;
+        case ASYNC:
+            getSerializer().enqueue(this->thread, std::forward<Function>(f));
+            break;
+        case SYNC:
+            QMetaObject::invokeMethod(QAbstractEventDispatcher::instance(thread),
+                                      [f=std::forward<Function>(f),&syncMutex]() mutable
+                                      {
+                                        std::invoke(std::forward<Function>(f));
+                                        syncMutex.unlock();
+                                      },
+                                      Qt::QueuedConnection);
+            break;
+        case NONBLOCKING_JOIN:
+            QMetaObject::invokeMethod(&eventLoop,
+                                      [this,&eventLoop,f=std::forward<Function>(f)]() mutable
+                                      {
+                                        QMetaObject::invokeMethod(QAbstractEventDispatcher::instance(thread),
+                                                                  [&eventLoop,f=std::forward<Function>(f)]() mutable
+                                                                  {
+                                                                    std::invoke(std::forward<Function>(f));
+                                                                    eventLoop.exit();
+                                                                  },
+                                                                  Qt::QueuedConnection);
+                                      },
+                                      Qt::QueuedConnection);
+            eventLoop.exec();
+            break;
+        }
         break;
     case DELETETHREAD:
-        thread = QThread::create([this,f=std::forward<Function>(f)](auto &&... args) mutable
+        thread = QThread::create([this,schedule,&syncMutex,&eventLoop,f=std::forward<Function>(f)]() mutable
         {
+            if(schedule == NONBLOCKING_JOIN)
+                connect(thread, &QThread::finished, [&eventLoop]() { eventLoop.exit(); });
+            connect(thread, &QThread::finished, [this]() { this->thread = nullptr; });
+            connect(thread, &QThread::finished, this, &WorkerThread::done);
+            connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+            std::invoke(std::forward<Function>(f));
+            if(schedule == SYNC)
+                syncMutex.unlock();
+        });
+        if(schedule == NONBLOCKING_JOIN)
+        {
+            QMetaObject::invokeMethod(&eventLoop, [this]() { this->thread->start(); }, Qt::QueuedConnection);
+            eventLoop.exec();
+        }
+        else
+            thread->start();
+        break;
+    case AUTODELETE:
+        thread = QThread::create([this,schedule,&syncMutex,&eventLoop,f=std::forward<Function>(f)]() mutable
+        {
+            if(schedule == NONBLOCKING_JOIN)
+                connect(thread, &QThread::finished, [&eventLoop]() { eventLoop.exit(); });
+            connect(thread, &QThread::finished, [this]() { this->thread = nullptr; });
+            connect(thread, &QThread::finished, this, &WorkerThread::done);
+            connect(this,  &WorkerThread::done, [this]() { delete this; });
+            connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+            std::invoke(std::forward<Function>(f));
+            if(schedule == SYNC)
+                syncMutex.unlock();
+        });
+        if(schedule == NONBLOCKING_JOIN)
+        {
+            QMetaObject::invokeMethod(&eventLoop, [this]() { this->thread->start(); }, Qt::QueuedConnection);
+            eventLoop.exec();
+        }
+        else
+            thread->start();
+        thread->start();
+        break;
+    }
+
+    if(schedule == SYNC)
+    {
+        syncMutex.lock();
+        syncMutex.unlock();
+    }
+}
+
+/**
+ * @brief Execute a function with no arguments in the threads context.
+ * @param schedule  schedule to use
+ * @param f         function to call
+ * @param args      arguments for f
+ *
+ * Executes the function f in the context of this worker thread. For the
+ * WorkerThread::PERSISTENT variant the function call will be queued in the
+ * event queue. This serializes and synchronizes function calls within this
+ * thread. Different schedules can be used, e.g. to wait for the execution
+ * to finish.
+ */
+template<class Function, typename... Args>
+void WorkerThread::exec(Schedule schedule, Function &&f, Args &&... args)
+{
+    QMutex syncMutex;       // for SYNC/JOIN
+    if(schedule == SYNC)
+        syncMutex.lock();
+
+    QEventLoop eventLoop;   // for NONBLOCKING_JOIN
+
+    switch(type)
+    {
+    case PERSISTENT:
+        // Wait for running event queue if we just started the thread.
+        while(!QAbstractEventDispatcher::instance(thread))
+            QThread::currentThread()->msleep(1);
+        switch(schedule)
+        {
+        case PAR:
+            QMetaObject::invokeMethod(QAbstractEventDispatcher::instance(thread),
+                                      [f=std::forward<Function>(f),args=std::make_tuple(std::forward<Args>(args)...)]() mutable
+                                      {
+                                        std::apply(std::forward<Function>(f), std::forward<decltype(args)>(args));
+                                      },
+                                      Qt::QueuedConnection);
+            break;
+        case ASYNC:
+            getSerializer().enqueue(this->thread, std::forward<Function>(f), std::forward<Args>(args)...);
+            break;
+        case SYNC:
+            QMetaObject::invokeMethod(QAbstractEventDispatcher::instance(thread),
+                                      [f=std::forward<Function>(f),args=std::make_tuple(std::forward<Args>(args)...),&syncMutex]() mutable
+                                      {
+                                        std::apply(std::forward<Function>(f), std::forward<decltype(args)>(args));
+                                        syncMutex.unlock();
+                                      },
+                                      Qt::QueuedConnection);
+            break;
+        case NONBLOCKING_JOIN:
+            QMetaObject::invokeMethod(&eventLoop,
+                                      [this,&eventLoop,f=std::forward<Function>(f),args=std::make_tuple(std::forward<Args>(args)...)]() mutable
+                                      {
+                                        QMetaObject::invokeMethod(QAbstractEventDispatcher::instance(thread),
+                                                                  [&eventLoop,f=std::forward<Function>(f),args=std::forward<decltype(args)>(args)]() mutable
+                                                                  {
+                                                                    std::apply(std::forward<Function>(f), std::forward<decltype(args)>(args));
+                                                                    eventLoop.exit();
+                                                                  },
+                                                                  Qt::QueuedConnection);
+                                      },
+                                      Qt::QueuedConnection);
+            eventLoop.exec();
+            break;
+        }
+        break;
+    case DELETETHREAD:
+        thread = QThread::create([this,schedule,&syncMutex,&eventLoop,f=std::forward<Function>(f)](auto &&... args) mutable
+        {
+            if(schedule == NONBLOCKING_JOIN)
+                connect(thread, &QThread::finished, [&eventLoop]() { eventLoop.exit(); });
             connect(thread, &QThread::finished, [this]() { this->thread = nullptr; });
             connect(thread, &QThread::finished, this, &WorkerThread::done);
             connect(thread, &QThread::finished, thread, &QThread::deleteLater);
             std::invoke(std::forward<Function>(f), std::forward<Args>(args)...);
+            if(schedule == SYNC)
+                syncMutex.unlock();
         }, std::forward<Args>(args)...);
-        thread->start();
+        if(schedule == NONBLOCKING_JOIN)
+        {
+            QMetaObject::invokeMethod(&eventLoop, [this]() { this->thread->start(); }, Qt::QueuedConnection);
+            eventLoop.exec();
+        }
+        else
+            thread->start();
         break;
     case AUTODELETE:
-        thread = QThread::create([this,f=std::forward<Function>(f)](auto &&... args) mutable
+        thread = QThread::create([this,schedule,&syncMutex,&eventLoop,f=std::forward<Function>(f)](auto &&... args) mutable
         {
+            if(schedule == NONBLOCKING_JOIN)
+                connect(thread, &QThread::finished, [&eventLoop]() { eventLoop.exit(); });
             connect(thread, &QThread::finished, [this]() { this->thread = nullptr; });
             connect(thread, &QThread::finished, this, &WorkerThread::done);
             connect(this,  &WorkerThread::done, [this]() { delete this; });
             connect(thread, &QThread::finished, thread, &QThread::deleteLater);
             std::invoke(std::forward<Function>(f), std::forward<Args>(args)...);
+            if(schedule == SYNC)
+                syncMutex.unlock();
         }, std::forward<Args>(args)...);
-        thread->start();
+        if(schedule == NONBLOCKING_JOIN)
+        {
+            QMetaObject::invokeMethod(&eventLoop, [this]() { this->thread->start(); }, Qt::QueuedConnection);
+            eventLoop.exec();
+        }
+        else
+            thread->start();
         break;
+    }
+
+    if(schedule == SYNC)
+    {
+        syncMutex.lock();
+        syncMutex.unlock();
     }
 }
 
@@ -463,6 +752,62 @@ template<class Function, typename... Args> inline
 WorkerThread *workerThread(Function &&f, Args &&... args)
 {
     return new WorkerThread(WorkerThread::AUTODELETE, std::forward<Function>(f), std::forward<Args>(args)...);
+}
+
+/**
+ * @brief Run a function in a separate thread with a given schedule.
+ * @param schedule  schedule to use
+ * @param f         function to call
+ *
+ * Starts a new thread in the same way as workerThread(f). However, a specific
+ * schedule is used, e.g. JOIN or NONBLOCKING_JOIN.
+ */
+template<class Function> inline
+WorkerThread *workerThread(WorkerThread::Schedule schedule, Function &&f)
+{
+    return new WorkerThread(WorkerThread::AUTODELETE, schedule, std::forward<Function>(f));
+}
+
+/**
+ * @brief Run a function with arguments in a separate thread with a given schedule.
+ * @param schedule  schedule to use
+ * @param f         function to call
+ * @param args      arguments for f
+ *
+ * Starts a new thread in the same way as workerThread(f, args). However, a
+ * specific schedule is use, e.g. JOIN or NONBLOCKING_JOIN.
+ */
+template<class Function, typename... Args> inline
+WorkerThread *workerThread(WorkerThread::Schedule schedule, Function &&f, Args &&...args)
+{
+    return new WorkerThread(WorkerThread::AUTODELETE, schedule, std::forward<Function>(f), std::forward<Args>(args)...);
+}
+
+/**
+ * @brief Run a function in a separate thread and wait, but don't block event processing.
+ * @param f         function to call
+ *
+ * Starts a new thread in the same way as workerThread(f). However, a local event loop
+ * is used to wait for the thread to finish without blocking event processing.
+ */
+template<class Function> inline
+WorkerThread *workerThreadJoin(Function &&f)
+{
+    return new WorkerThread(WorkerThread::AUTODELETE, WorkerThread::NONBLOCKING_JOIN, std::forward<Function>(f));
+}
+
+/**
+ * @brief Run a function with arguments in a separate thread and wait, but don't block event processing.
+ * @param f         function to call
+ * @param args      arguments for f
+ *
+ * Starts a new thread in the same way as workerThread(f, args). However, a local event loop
+ * is used to wait for the thread to finish without blocking event processing.
+ */
+template<class Function, typename... Args> inline
+WorkerThread *workerThreadJoin(Function &&f, Args &&... args)
+{
+    return new WorkerThread(WorkerThread::AUTODELETE, WorkerThread::NONBLOCKING_JOIN, std::forward<Function>(f), std::forward<Args>(args)...);
 }
 
 /**
@@ -511,7 +856,7 @@ void guiThread(WorkerThread::Schedule schedule, Function &&f)
         QMetaObject::invokeMethod(qGuiApp, f, Qt::QueuedConnection);
         break;
     case WorkerThread::ASYNC:
-        WorkerThread::getSerializer().enqueue(std::forward<Function>(f));
+        WorkerThread::getGUISerializer().enqueue(nullptr, std::forward<Function>(f));
         break;
     case WorkerThread::SYNC:
         {
@@ -526,6 +871,24 @@ void guiThread(WorkerThread::Schedule schedule, Function &&f)
                                       Qt::QueuedConnection);
             syncMutex.lock();   // wait for GUI call to finish
             syncMutex.unlock();
+        }
+        break;
+    case WorkerThread::NONBLOCKING_JOIN:
+        {
+            QEventLoop eventLoop;
+            QMetaObject::invokeMethod(&eventLoop,
+                                      [&eventLoop,f=std::forward<Function>(f)]() mutable
+                                      {
+                                        QMetaObject::invokeMethod(qApp,
+                                                                  [&eventLoop,f=std::forward<Function>(f)]() mutable
+                                                                  {
+                                                                    std::invoke(std::forward<Function>(f));
+                                                                    eventLoop.exit();
+                                                                  },
+                                                                  Qt::QueuedConnection);
+                                      },
+                                      Qt::QueuedConnection);
+            eventLoop.exec();
         }
         break;
     }
@@ -554,7 +917,7 @@ void guiThread(WorkerThread::Schedule schedule, Function &&f, Args &&... args)
                                   Qt::QueuedConnection);
         break;
     case WorkerThread::ASYNC:
-        WorkerThread::getSerializer().enqueue(std::forward<Function>(f), std::forward<Args>(args)...);
+        WorkerThread::getGUISerializer().enqueue(nullptr, std::forward<Function>(f), std::forward<Args>(args)...);
         break;
     case WorkerThread::SYNC:
         {
@@ -571,11 +934,30 @@ void guiThread(WorkerThread::Schedule schedule, Function &&f, Args &&... args)
             syncMutex.unlock();
         }
         break;
+    case WorkerThread::NONBLOCKING_JOIN:
+        {
+            QEventLoop eventLoop;
+            QMetaObject::invokeMethod(&eventLoop,
+                                      [&eventLoop,f=std::forward<Function>(f),args=std::make_tuple(std::forward<Args>(args)...)]() mutable
+                                      {
+                                        QMetaObject::invokeMethod(qApp,
+                                                                  [&eventLoop,f=std::forward<Function>(f),args=std::forward<decltype(args)>(args)]() mutable
+                                                                  {
+                                                                    std::apply(std::forward<Function>(f), std::forward<decltype(args)>(args));
+                                                                    eventLoop.exit();
+                                                                  },
+                                                                  Qt::QueuedConnection);
+                                      },
+                                      Qt::QueuedConnection);
+            eventLoop.exec();
+        }
+        break;
     }
 }
 
 /**
  * @brief Queue a new function call to be executed serialized for this thread.
+ * @param thread    QThread object if serialized on WorkerThread's event loop
  * @param f         function to call
  *
  * This will queue new function calls to be executed in the GUI's event loop.
@@ -586,9 +968,9 @@ void guiThread(WorkerThread::Schedule schedule, Function &&f, Args &&... args)
  * has already finished, the underlying SerializerImpl object is deleted.
  */
 template<class Function>
-void WorkerThread::Serializer::SerializerImpl::enqueue(Function &&f)
+void WorkerThread::Serializer::SerializerImpl::enqueue(QThread *thread, Function &&f)
 {
-    auto lambda = [f=std::forward<Function>(f),this]() mutable
+    auto lambda = [f=std::forward<Function>(f),this,thread]() mutable
     {
         std::invoke(std::forward<Function>(f));
 
@@ -605,7 +987,12 @@ void WorkerThread::Serializer::SerializerImpl::enqueue(Function &&f)
         }
         else
         {
-            QMetaObject::invokeMethod(qGuiApp, this->queue.dequeue(), Qt::QueuedConnection);
+            if(thread == nullptr)
+                QMetaObject::invokeMethod(qGuiApp, this->queue.dequeue(), Qt::QueuedConnection);
+            else
+                QMetaObject::invokeMethod(QAbstractEventDispatcher::instance(thread),
+                                          this->queue.dequeue(),
+                                          Qt::QueuedConnection);
         }
         this->mutex.unlock();
     };
@@ -614,7 +1001,12 @@ void WorkerThread::Serializer::SerializerImpl::enqueue(Function &&f)
     if(this->isEmpty() && !running)
     {
         running = true;
-        QMetaObject::invokeMethod(qGuiApp, lambda, Qt::QueuedConnection);
+        if(thread == nullptr)
+            QMetaObject::invokeMethod(qGuiApp, lambda, Qt::QueuedConnection);
+        else
+            QMetaObject::invokeMethod(QAbstractEventDispatcher::instance(thread),
+                                      lambda,
+                                      Qt::QueuedConnection);
     }
     else
     {
@@ -625,6 +1017,7 @@ void WorkerThread::Serializer::SerializerImpl::enqueue(Function &&f)
 
 /**
  * @brief Queue a new function call to be executed serialized for this thread.
+ * @param thread    QThread object if serialized on WorkerThread's event loop
  * @param f         function to call
  * @param args      arguments to f
  *
@@ -636,9 +1029,9 @@ void WorkerThread::Serializer::SerializerImpl::enqueue(Function &&f)
  * has already finished, the underlying SerializerImpl object is deleted.
  */
 template<class Function, typename... Args>
-void WorkerThread::Serializer::SerializerImpl::enqueue(Function &&f, Args &&... args)
+void WorkerThread::Serializer::SerializerImpl::enqueue(QThread *thread, Function &&f, Args &&... args)
 {
-    auto lambda = [f=std::forward<Function>(f),args=std::make_tuple(std::forward<Args>(args)...),this]() mutable
+    auto lambda = [f=std::forward<Function>(f),args=std::make_tuple(std::forward<Args>(args)...),this,thread]() mutable
     {
         std::apply(std::forward<Function>(f), std::forward<decltype(args)>(args));
 
@@ -655,7 +1048,12 @@ void WorkerThread::Serializer::SerializerImpl::enqueue(Function &&f, Args &&... 
         }
         else
         {
-            QMetaObject::invokeMethod(qGuiApp, this->queue.dequeue(), Qt::QueuedConnection);
+            if(thread == nullptr)
+                QMetaObject::invokeMethod(qGuiApp, this->queue.dequeue(), Qt::QueuedConnection);
+            else
+                QMetaObject::invokeMethod(QAbstractEventDispatcher::instance(thread),
+                                          this->queue.dequeue(),
+                                          Qt::QueuedConnection);
         }
         this->mutex.unlock();
     };
@@ -664,7 +1062,12 @@ void WorkerThread::Serializer::SerializerImpl::enqueue(Function &&f, Args &&... 
     if(this->isEmpty() && !running)
     {
         running = true;
-        QMetaObject::invokeMethod(qGuiApp, lambda, Qt::QueuedConnection);
+        if(thread == nullptr)
+            QMetaObject::invokeMethod(qGuiApp, lambda, Qt::QueuedConnection);
+        else
+            QMetaObject::invokeMethod(QAbstractEventDispatcher::instance(thread),
+                                      lambda,
+                                      Qt::QueuedConnection);
     }
     else
     {
@@ -677,7 +1080,7 @@ void WorkerThread::Serializer::SerializerImpl::enqueue(Function &&f, Args &&... 
  * @brief Destructor for the Serializer's per-thread object.
  *
  * Given that only one Serializer object is used per thread (by calling
- * getSerializer() instead of the constructor) the destructor is called when
+ * getGUISerializer() instead of the constructor) the destructor is called when
  * the thread finishes. The destructor only cleans up if there are no more
  * functions in the queue and none are still running. Otherwise, the lambda
  * functions wrapping the actual function call will clean up everything when

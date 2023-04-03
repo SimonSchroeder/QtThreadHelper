@@ -21,6 +21,7 @@ public slots:
     void example7();
     void example8();
     void example9();
+    void example10();
 
 protected:
     void doExample3(int width);

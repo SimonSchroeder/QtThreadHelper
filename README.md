@@ -15,6 +15,7 @@ Then include the header where you want to use these functions:
 
 ### How to use
 1. Create a single-shot temporary thread by calling `workerThread([](){ /* do stuff */ });`.
+1. Use `workerThreadJoin([](){ /* do stuff */ });` instead to wait for the thread to finish without blocking the event loop of the caller.
 1. Queue function calls into the GUI thread (when manipulating GUI elements) from another thread by calling `guiThread([]() { /* call function on widget */ });`. Use `guiThread(WorkerThread::SYNC, []() { /* ... */ });` for a blocking call.
 1. Create a permanent worker thread object `WorkerThread *wt = new WorkerThread()` with its own event queue and continuously queue function calls: `wt->exec([]() { /* do stuff */ })`. Stop the event queue with `wt->quit()`.
 1. Easily use function arguments in all of the above, e.g. `workerThread([](int i) { /* do stuff */ }, 1);`.
@@ -51,6 +52,26 @@ void MyClass::foo()
 ```
 `workerThread(...)` calls `QThread::create(...)->start()` and also makes sure to clean-up the thread after itself. In the simplest example the whole function body is put inside the lambda.
 
+### Use case 1.1
+Sometimes there is some work done before calling the worker thread with some variables on the stack, which we cannot destroy while the thread is running. Or we might want to return a variable from the thread to be used later. (Or our original function we try to rewrite did return a result.) In all these cases we would like to wait for the thread to finish (which makes it a *joinable thread* in the language of modern C++). However, if we block entirely we would not need the worker thread in the first place. This is solved by running a (nested) event loop in the background until the worker thread is finished. (This idea is copied from calling `QDialog::exec()` which internally runs a nested event loop, as well.)
+```c++
+double MyClass::computedValue()
+{
+    double ret_val = 0.0;
+    
+    workerThreadJoin([&rev_val]()
+    {
+        /* do some stuff */
+        QThread::sleep(10); // simulate work
+        
+        ret_val = 42.0; // we could not access this variable if it went out of scope in the surrounding process
+    });
+    
+    return ret_val;
+}
+```
+`workerThreadJoin` will wait in the calling thread. Any slots will still be handled.
+
 ## Use case 2
 Often we have to update the GUI after doing something. One prominent example is using a `QProgressDialog` which needs to update while the thread is running. Let's start off by a progress dialog in the GUI thread:
 ```c++
@@ -80,14 +101,14 @@ void MyClass::compute()
         guiThread(WorkerThread::SYNC, [this,&progress]()
         {
             progress = new QProgressDialog(this);
-            progress->setWindowModality(Qt::WindowModel);
+            progress->setWindowModality(Qt::WindowModal);
         });
         
         for(int i = 0; i < 10; ++i)
         {
             /* do some stuff */
-            QThread::sleep(1); //simulate work
-            guiThread([progress,i]() { progress.setValue(10 * (i+1)); }); // needs to be executed in GUI thread
+            QThread::sleep(1); // simulate work
+            guiThread([progress,i]() { progress->setValue(10 * (i+1)); }); // needs to be executed in GUI thread
         }
         
         guiThread([progress]() { delete progress; }); // don't forget to clean up
@@ -99,6 +120,28 @@ Using `guiThread(...)` executes the function in the GUI thread by using `QMetaOb
 `workerThread(...)` internally uses the class `WorkerThread` (note the difference between small 'w' and capital 'W'). The lib's enums live inside this class. The construction of the `QProgressDialog` needs to finish before we do anything else with it. This is done by providing the parameter `WorkerThread::SYNC` to `guiThread`. Internally, it uses a `QMutex` to synchronize the GUI thread and this thread. So, it is basically a blocking call into the GUI thread (make sure that the GUI thread is always progressing). Now, the progress dialog can even react to the cancel button directly without any problems (we still need to handle it inside our computation, though). Because of modality the user has to wait for the computation to finish, but the GUI stays responsive (for the progress dialog) and the computation is a lot faster than calling `QApplication::processEvents()`.
 
 This use case is highly encouraged.
+
+### Use case 2.1
+Again, `workerThreadJoin` allows us to write this slightly differently. In general, nested event loops should be avoided. Especially with multiple functions using `workerThreadJoin` internally, it is possible to accidentally create deeply nested event loops. In some cases, the following approach might still arise from a larger context:
+```c++
+void MyClass::compute()
+{
+    QProgressDialog progress(this);
+    progress->setWindowModality(Qt::WindowModal);
+    
+    workerThreadJoin([&progress]()
+    {
+        for(int i = 0; i < 10; ++i)
+        {
+            /* do some stuff */
+            QThread::sleep(1); // simulate work
+            guiThread([&progress,i]() { progress.setValue(10 * (i+1)); });
+        }
+    });
+    
+    // 'progress' is a variable on the stack and "deletes" itself
+}
+```
 
 ## Use case 3
 This last use case employs the class `WorkerThread` directly. You might think of some scenarios where a dedicated worker thread is helpful. One such case is drawing on a canvas widget when updating might take a little too long. In that case we can put drawing into a separate thread, first drawing onto a `QPixmap` and later blitting that pixmap onto the widget. This also allows to interrupt drawing when done correctly (e.g. because the user moved around or zoomed). Let's start out with a constructor and destructor (here I will prefix all member variable with `m_`):
